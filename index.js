@@ -38,6 +38,8 @@ const TOKEN_MAKS = 2048;
 const FELT_MAKS = 60;          // tegn i tokenets navn, figur og gender
 const BESKED_MAKS = 16 * 1024; // bytes pr. hændelse; den største er en vej med 16 punkter
 const OPRYD_MS = 60000;
+const ONLINE_MS = 5000;        // højst så tit går antallet online ud til alle
+const INDE = 'inde';           // socket.io-rummet med alle, der er gået ind
 
 const folk = new Map();        // id -> personen, som den står i sit rum
 const smidtUd = new Map();     // id -> ms, hvor personen må komme ind igen
@@ -126,7 +128,7 @@ function gaaInd(p, rum, sted) {
   p.socket.to(kanal(rum.navn)).emit('kom', { person: vis(p, nu) });
   p.socket.join(kanal(rum.navn));
   const her = [...folk.values()].filter((q) => q.rum.navn === rum.navn);
-  p.socket.emit('rummet', { rum: rum.navn, nu, folk: her.map((q) => vis(q, nu)) });
+  p.socket.emit('rummet', { rum: rum.navn, nu, online: folk.size, folk: her.map((q) => vis(q, nu)) });
 }
 
 function forladRum(p) {
@@ -137,6 +139,21 @@ function forladRum(p) {
 function gaaUd(p) {
   folk.delete(p.id);
   forladRum(p);
+  meldOnline();
+}
+
+// Antallet online til alle, der er inde. Udsendelsen venter til efter den igangværende hændelse, så en konto,
+// der forbinder igen (en ud, en ind), ikke ændrer tallet, og højst én går ud hvert ONLINE_MS.
+let onlineSendt = 0, onlineSidst = 0, onlineUr = null;
+function meldOnline() {
+  if (onlineUr) return;
+  onlineUr = setTimeout(() => {
+    onlineUr = null;
+    if (folk.size === onlineSendt) return;
+    onlineSendt = folk.size;
+    onlineSidst = Date.now();
+    io.to(INDE).emit('online', { antal: onlineSendt });
+  }, Math.max(0, onlineSidst + ONLINE_MS - Date.now()));
 }
 
 async function sig(p, rum, tekst) {
@@ -233,6 +250,8 @@ io.on('connection', (socket) => {
     };
     socket.data.person = p;
     folk.set(p.id, p);
+    socket.join(INDE);
+    meldOnline();
     clearTimeout(frist);
     const oensket = punkt([d.x, d.z]);
     gaaInd(p, rum, (oensket && rum.stil(oensket)) || rum.start);

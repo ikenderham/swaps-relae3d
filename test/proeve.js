@@ -152,7 +152,7 @@ class Klient {
   }
 
   modtag(h, d) {
-    this.post.push({ h, d });
+    this.post.push({ h, d, t: Date.now() });
     for (const v of [...this.venter]) this.tjek(v);
   }
 
@@ -162,6 +162,7 @@ class Klient {
     const [x] = this.post.splice(i, 1);
     this.venter.splice(this.venter.indexOf(v), 1);
     clearTimeout(v.ur);
+    this.sidst = x.t;   // hvornår den hændelse, vent sidst gav, kom
     v.ok(x.d);
   }
 
@@ -209,6 +210,26 @@ async function proeve(navn, fn) {
   console.log(`ok   ${navn}`);
 }
 
+/** online på et relæ for sig, så tiderne ikke blandes med de andre prøvers: forbind igen og gå. */
+async function onlineForSig() {
+  const r = await startRelae({ PHP_BASE: `http://127.0.0.1:${STUB}/3d`, RUM_BASE: RUMMAPPE });
+  const f = new Klient(r.port), g = new Klient(r.port);
+  klienter.push(f, g);
+  await f.ind(token({ id: 201, navn: 'ZZf' }), 'gade', 0.55, 0.55);
+  await g.ind(token({ id: 202, navn: 'ZZg' }), 'gade', 0.65, 0.55);
+  assert.deepEqual(await g.vent('online', undefined, 7000), { antal: 2 });
+  await sov(g.sidst + 5200 - Date.now());
+  // Samme konto forbinder igen: én ud og én ind i samme hændelse, så tallet ændrer sig ikke undervejs
+  const f2 = new Klient(r.port);
+  klienter.push(f2);
+  await f2.ind(token({ id: 201, navn: 'ZZf' }), 'gade', 0.55, 0.55);
+  await f.vent('lukket');
+  await g.ingen('online', 1000);
+  // Én går, mere end 5 sekunder efter sidste udsendelse: tallet går ud med det samme
+  f2.luk();
+  assert.deepEqual(await g.vent('online', undefined, 1000), { antal: 1 });
+}
+
 // A, C og E er testere, B og D admins
 const A = { id: 101, navn: 'ZZa' }, B = { id: 102, navn: 'ZZb', admin: true }, C = { id: 103, navn: 'ZZc' };
 const D = { id: 104, navn: 'ZZd', admin: true }, E = { id: 105, navn: 'ZZe' };
@@ -219,6 +240,9 @@ let fejlet = false;
 try {
   const relae = await startRelae({ PHP_BASE: `http://127.0.0.1:${STUB}/3d`, RUM_BASE: RUMMAPPE });
   const P = relae.port;
+  // Kører ved siden af de andre prøver; en fejl gemmes, til den hentes nederst
+  const onlineSamtidig = proeve('online: samme konto, der forbinder igen, ændrer ikke tallet, og den, der går, sendes med det samme',
+    onlineForSig).catch((fejl) => fejl);
   const ny = (port = P) => { const k = new Klient(port); klienter.push(k); return k; };
   const online = async () => (await hentJson(`http://127.0.0.1:${P}/health`)).online;
 
@@ -236,7 +260,7 @@ try {
     assert.deepEqual(await hentJson(`http://127.0.0.1:${P}/health`), { ok: true, online: 0, commit: 'lokal' });
   });
 
-  const a = ny(), b = ny();
+  const a = ny(), b = ny(), udenInd = ny();
 
   await proeve('uden ind afvises alt andet', async () => {
     await a.afvist('gaa', { vej: [[0.55, 0.55], [1, 0.55]] }, 'ikke_inde');
@@ -266,12 +290,14 @@ try {
     const r = await a.ind(token(A), 'gade', 0.55, 0.55);
     assert.equal(r.rum, 'gade');
     assert.ok(Math.abs(r.nu - Date.now()) < 1000);
+    assert.equal(r.online, 1);
     assert.deepEqual(r.folk, [{ id: 101, navn: 'ZZa', figur: 'hvid-mand', gender: 'm', hudtone: 0, admin: false, x: 0.55, z: 0.55 }]);
     await a.afvist('ind', { token: token(A), rum: 'gade' }, 'allerede_inde');
   });
 
   await proeve('B kommer ind uden for gulvet, står på nærmeste celle og ser A; A ser B komme', async () => {
     const r = await b.ind(token(B), 'gade', 1.03, 2.3);
+    assert.equal(r.online, 2);
     const selv = r.folk.find((p) => p.id === 102);
     assert.ok(naer(selv.x, 1.05) && naer(selv.z, 1.95), JSON.stringify(selv));
     assert.deepEqual(r.folk.map((p) => p.id).sort(), [101, 102]);
@@ -321,6 +347,16 @@ try {
     gang = await a.vent('gaar');
     assert.deepEqual(gang.vej, [her, [3.55, 1.85]]);
     await b.vent('gaar');
+  });
+
+  await proeve('online går til dem, der er inde, når tallet ændrer sig, højst hvert 5. sekund', async () => {
+    // A kom ind først og fik 1 med det samme; B kom lige efter, og 2 går ud, når de 5 sekunder er gået
+    const foerste = await a.vent('online'), t1 = a.sidst;
+    const anden = await a.vent('online', undefined, 7000), t2 = a.sidst;
+    assert.deepEqual([foerste, anden], [{ antal: 1 }, { antal: 2 }]);
+    assert.ok(t2 - t1 >= 4900, `${t2 - t1} ms mellem de to`);
+    assert.deepEqual(await b.vent('online', undefined, 7000), { antal: 2 });
+    assert.ok(!udenInd.post.some((x) => x.h === 'online'), 'en forbindelse uden ind fik online');
   });
 
   await proeve('skriver går til de andre i rummet, ikke til afsenderen', async () => {
@@ -430,7 +466,7 @@ try {
   await proeve('gennem en dør til et rum uden dør tilbage lander man på start', async () => {
     await c.ind(token(C), 'gade', 0.25, 1.75);
     const r = await c.spoerg('skift', { rum: 'kaelder', via: 'kaelder' }, 'rummet');
-    assert.deepEqual(r, { rum: 'kaelder', nu: r.nu, folk: [{ id: 103, navn: 'ZZc', figur: 'hvid-mand', gender: 'm', hudtone: 0, admin: false, x: 0.55, z: 0.55 }] });
+    assert.deepEqual(r, { rum: 'kaelder', nu: r.nu, online: 3, folk: [{ id: 103, navn: 'ZZc', figur: 'hvid-mand', gender: 'm', hudtone: 0, admin: false, x: 0.55, z: 0.55 }] });
   });
 
   await proeve('smid_ud: kun admins, ikke sig selv, ikke en anden admin, kun en, der er her', async () => {
@@ -489,12 +525,14 @@ try {
     assert.equal(await e.vent('disconnect'), 'io server disconnect');
   });
 
-  await proeve('en, der kobler fra, går: rummet får gik, og /health tæller ned', async () => {
+  await proeve('en, der kobler fra, går: rummet får gik, online tæller ned, og /health med', async () => {
+    a3.post = a3.post.filter((x) => x.h !== 'online');
     await b.spoerg('skift', { rum: 'gade' }, 'rummet');
     assert.equal((await a3.vent('kom')).person.id, 102);
     b.luk();
     assert.deepEqual(await a3.vent('gik'), { id: 102 });
     assert.equal(await online(), 2);
+    assert.deepEqual(await a3.vent('online', (x) => x.antal === 2, 7000), { antal: 2 });
   });
 
   await proeve('rummene kan hentes over HTTP, og PHP nås på et *.localhost-navn', async () => {
@@ -508,6 +546,8 @@ try {
     assert.deepEqual(await f.spoerg('sig', { tekst: 'hej over nettet' }, 'sagde'), { id: 106, tekst: 'hej over nettet' });
   });
 
+  const fejlSamtidig = await onlineSamtidig;
+  if (fejlSamtidig) throw fejlSamtidig;
   console.log('\nAlle prøver bestået.');
 } catch (fejl) {
   fejlet = true;
