@@ -226,7 +226,7 @@ try {
   if (fs.existsSync(KLIENTENS_GAAKORT)) {
     await proeve('gaakort.js er byte for byte klientens 3d/js/gaakort.js', async () => {
       assert.ok(fs.readFileSync(path.join(RELAE, 'gaakort.js')).equals(fs.readFileSync(KLIENTENS_GAAKORT)),
-        'kopiér 3d/js/gaakort.js til relae3d/gaakort.js igen');
+        'relae3d/gaakort.js er ikke længere klientens: kør npm run gaakort');
     });
   } else {
     console.log('-    gaakort.js sammenlignes ikke: 3d/js/gaakort.js ligger ikke ved siden af relæet');

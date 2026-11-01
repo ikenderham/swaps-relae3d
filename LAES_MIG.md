@@ -21,8 +21,10 @@ swaps3d-grenen.
 | `lokalt.sh` | starter relæet i testmiljøet |
 | `render.yaml` | tjenesten på Render |
 
-`gaakort.js` rettes aldrig her. Rettes `3d/js/gaakort.js`, kopieres den hertil igen, og `npm test`
-siger til, hvis kopien ikke er ens.
+`gaakort.js` rettes aldrig her. Rettes `3d/js/gaakort.js`, lægger `npm run gaakort` den nye ind, og
+`npm test` fejler, så længe kopien ikke er byte for byte ens.
+
+Relæet bruger socket.io 4.8.4; klienten har socket.io-klienten i samme hovedversion i `3d/vendor`.
 
 ## Miljøet
 
