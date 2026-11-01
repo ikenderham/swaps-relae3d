@@ -51,15 +51,23 @@ PHP, og `S3D_RELAE_URL` i den lokale `3d_config.php` er `http://localhost:3013`.
 ## På Render
 
 1. Et nyt **privat** GitHub-arkiv, `swaps-relae3d`, med denne mappe på grenen `main`.
-2. På render.com: **New → Blueprint**, vælg arkivet. Render læser `render.yaml`: tjenesten
-   `swaps-relae3d` i Frankfurt på den gratis plan.
-3. Render spørger efter `S3D_RELAE_HEMMELIGHED`. Den skal være præcis den samme som
-   `S3D_RELAE_HEMMELIGHED` i `httpd.private/3d_config.php` på swaps.dk. Ejeren kopierer den selv, og den
-   skrives aldrig i git, i chatten eller i en besked. Skiftes den, skal den skiftes begge steder.
-4. Når Render har bygget, svarer `https://swaps-relae3d.onrender.com/health` (eller den adresse,
-   Render giver) med `{"ok":true,"online":0,"commit":"<de første 7 tegn af commit'et>"}`.
-5. `S3D_RELAE_URL` i `httpd.private/3d_config.php` sættes til den adresse, uden `/` til sidst. Først
-   derefter lægges 3D-siden op med klienten, der forbinder.
+2. Hemmeligheden laves på serveren af 3D's PHP-hjælper (`tools/3d/db/LAES_MIG.md` i swaps3d-grenen).
+   Ejeren kører den selv i Git Bash i `C:\xampp\htdocs\swaps3d`:
+
+   ```bash
+   ssh swaps 'php -- https://swaps-relae3d.onrender.com' < tools/3d/db/lav_relae_hemmelighed.php
+   ```
+
+   Den skriver hemmeligheden og relæets adresse (`S3D_RELAE_URL`) i `httpd.private/3d_config.php` og
+   viser hemmeligheden én gang.
+3. På render.com: **New → Blueprint**, vælg arkivet. Render læser `render.yaml`: tjenesten
+   `swaps-relae3d` i Frankfurt på den gratis plan. Render spørger efter `S3D_RELAE_HEMMELIGHED`: den
+   hemmelighed, hjælperen viste. Den skrives aldrig i git, i chatten eller i en besked, og skiftes den,
+   skal den skiftes begge steder.
+4. Når Render har bygget, svarer `https://swaps-relae3d.onrender.com/health` med
+   `{"ok":true,"online":0,"commit":"<de første 7 tegn af commit'et>"}`. Giver Render en anden adresse,
+   køres hjælperen igen med den; hemmeligheden bliver, som den er.
+5. Først derefter lægges 3D-siden op med klienten, der forbinder.
 
 Render bygger igen ved hver push til `main`. Den gratis plan sover efter 15 minutter uden trafik, og
 den første, der kommer ind bagefter, venter op til et minut.
