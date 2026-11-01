@@ -1,0 +1,20 @@
+{
+  "name": "swaps-relae3d",
+  "version": "1.0.0",
+  "description": "Swaps 3D: realtids-relæ for den isometriske 3D-verden (socket.io, ingen database)",
+  "private": true,
+  "license": "UNLICENSED",
+  "type": "module",
+  "main": "index.js",
+  "engines": { "node": "24.x" },
+  "scripts": {
+    "start": "node index.js",
+    "test": "node test/proeve.js"
+  },
+  "dependencies": {
+    "socket.io": "^4.8.4"
+  },
+  "devDependencies": {
+    "socket.io-client": "^4.8.4"
+  }
+}

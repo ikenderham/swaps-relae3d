@@ -1,0 +1,21 @@
+# Render Blueprint: 3D-verdenens relæ, en særskilt tjeneste ved siden af chattens relæ (swaps-relay-eu),
+# som den ikke deler kode, nøgler eller adresse med.
+services:
+  - type: web
+    name: swaps-relae3d
+    runtime: node
+    region: frankfurt
+    plan: free
+    buildCommand: npm ci --omit=dev
+    startCommand: node index.js
+    healthCheckPath: /health
+    envVars:
+      - key: PHP_BASE
+        value: https://www.swaps.dk/3d
+      - key: RUM_BASE
+        value: https://www.swaps.dk/3d/filer/rum
+      - key: CORS_ORIGIN
+        value: https://www.swaps.dk,https://swaps.dk
+      # Ejeren skriver den selv i Render: den samme som S3D_RELAE_HEMMELIGHED i httpd.private/3d_config.php
+      - key: S3D_RELAE_HEMMELIGHED
+        sync: false
