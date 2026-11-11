@@ -1,4 +1,4 @@
-// Swaps 3D: realtids-relæet for den isometriske 3D-verden (tools/3d/PLAN_ISOMETRISK.md afsnit 18).
+// Swaps 3D: realtids-relæet for den isometriske 3D-verden (tools/3d/PLAN_ISOMETRISK.md afsnit 18 og 20).
 // Uden database: hvem man er, står i et HMAC-token fra 3D's PHP, og beskeder filtreres og gemmes af
 // PHP (3d/besked.php). Relæet ved kun, hvem der er i hvilket rum, og hvor de går.
 import http from 'node:http';
@@ -36,6 +36,11 @@ const SMID_UD_MS = 10 * 60000;
 const PHP_MS = 8000;
 const TOKEN_MAKS = 2048;
 const FELT_MAKS = 60;          // tegn i tokenets navn, figur og gender
+const FIGUR = /^[a-z0-9_-]{1,40}$/;        // en figur i 3d/filer/figurer
+const TOEJ_DELE = 8;
+const BAAS = /^[a-z0-9_-]{1,20}$/;
+const TOEJ_FIL = /^[a-z0-9_-]{1,60}\.glb$/; // en tøjfil i 3d/filer/toej
+const HANDLINGER = new Set(['hop', 'dans', 'nik', 'snur']);
 const BESKED_MAKS = 16 * 1024; // bytes pr. hændelse; den største er en vej med 16 punkter
 const OPRYD_MS = 60000;
 const ONLINE_MS = 5000;        // højst så tit går antallet online ud til alle
@@ -63,10 +68,11 @@ const io = new Server(server, {
 const hmac = (data) => crypto.createHmac('sha256', HEMMELIGHED).update(data).digest();
 
 /**
- * Tokenet fra 3d/relae_token.php: base64url(json).base64url(hmac_sha256(json)). Giver indholdet, når
- * signaturen passer og exp ikke er passeret, ellers null.
+ * Et token fra 3D's PHP: base64url(json).base64url(hmac_sha256(json)) med typ, id, iat og exp. Giver
+ * indholdet, når signaturen passer, exp ikke er passeret, og typen er typ, ellers null. Et token uden typ
+ * er et login (ind), som relae_token.php lavede dem før.
  */
-function laesToken(token) {
+function laesToken(token, typ) {
   if (typeof token !== 'string' || token.length > TOKEN_MAKS) return null;
   const dele = token.split('.');
   if (dele.length !== 2) return null;
@@ -77,7 +83,24 @@ function laesToken(token) {
   try { k = JSON.parse(json.toString('utf8')); } catch { return null; }
   const id = Number(k && k.id);
   if (!Number.isSafeInteger(id) || id < 1 || !(Number(k.exp) > Date.now() / 1000)) return null;
+  if ((k.typ === undefined ? 'ind' : k.typ) !== typ) return null;
   return { ...k, id };
+}
+
+/** Et token af typen typ, der gælder forbindelsens egen bruger, eller null. */
+function egetToken(p, token, typ) {
+  const k = laesToken(token, typ);
+  return k && k.id === p.id ? k : null;
+}
+
+/** Tøjet {bås: fil} fra et token, højst TOEJ_DELE dele, eller null, når det ikke ser sådan ud. */
+function toejFra(v) {
+  // Intet tøj: ældre tokens har ikke feltet, og PHP skriver et tomt array som []
+  if (v === undefined || v === null || (Array.isArray(v) && !v.length)) return {};
+  if (typeof v !== 'object' || Array.isArray(v)) return null;
+  const dele = Object.entries(v);
+  const gyldig = ([baas, fil]) => BAAS.test(baas) && typeof fil === 'string' && TOEJ_FIL.test(fil);
+  return dele.length <= TOEJ_DELE && dele.every(gyldig) ? Object.fromEntries(dele) : null;
 }
 
 /** POST til 3D's PHP med HMAC over den rå krop i X-S3D-Signatur. */
@@ -116,12 +139,12 @@ function plads(p, nu) {
 /** Personen, som de andre ser den; vej og t0 kun, mens den går. */
 function vis(p, nu) {
   const { x, z } = plads(p, nu);
-  const ud = { id: p.id, navn: p.navn, figur: p.figur, gender: p.gender, hudtone: p.hudtone, admin: p.admin, x, z };
+  const ud = { id: p.id, navn: p.navn, figur: p.figur, toej: p.toej, gender: p.gender, hudtone: p.hudtone, admin: p.admin, x, z };
   if (p.vej) Object.assign(ud, { vej: tilNet(p.vej), t0: p.t0 });
   return ud;
 }
 
-/** Personen står i rummet: rummet til personen selv (med sig selv i folk), kom til de andre. */
+/** Personen står i rummet: rummet og antallet online til personen selv (med sig selv i folk), kom til de andre. */
 function gaaInd(p, rum, sted) {
   Object.assign(p, { rum, x: sted.x, z: sted.z, vej: null });
   const nu = Date.now();
@@ -129,6 +152,8 @@ function gaaInd(p, rum, sted) {
   p.socket.join(kanal(rum.navn));
   const her = [...folk.values()].filter((q) => q.rum.navn === rum.navn);
   p.socket.emit('rummet', { rum: rum.navn, nu, online: folk.size, folk: her.map((q) => vis(q, nu)) });
+  p.socket.emit('online', onlineNu());
+  meldOnline();
 }
 
 function forladRum(p) {
@@ -142,17 +167,25 @@ function gaaUd(p) {
   meldOnline();
 }
 
-// Antallet online til alle, der er inde. Udsendelsen venter til efter den igangværende hændelse, så en konto,
-// der forbinder igen (en ud, en ind), ikke ændrer tallet, og højst én går ud hvert ONLINE_MS.
-let onlineSendt = 0, onlineSidst = 0, onlineUr = null;
+/** Antallet inde i hele 3D og pr. offentligt rum (rumnavnene i fast orden). */
+function onlineNu() {
+  const rum = new Map();
+  for (const p of folk.values()) rum.set(p.rum.navn, (rum.get(p.rum.navn) || 0) + 1);
+  return { antal: folk.size, rum: Object.fromEntries([...rum].sort(([a], [b]) => (a < b ? -1 : 1))) };
+}
+
+// Antallet online til alle, der er inde, når det ændrer sig. Udsendelsen venter til efter den igangværende
+// hændelse, så en konto, der forbinder igen (en ud, en ind), ikke ændrer tallet, og højst én går ud hvert ONLINE_MS.
+let onlineSendt = '', onlineSidst = 0, onlineUr = null;
 function meldOnline() {
   if (onlineUr) return;
   onlineUr = setTimeout(() => {
     onlineUr = null;
-    if (folk.size === onlineSendt) return;
-    onlineSendt = folk.size;
+    const nu = onlineNu(), json = JSON.stringify(nu);
+    if (json === onlineSendt) return;
+    onlineSendt = json;
     onlineSidst = Date.now();
-    io.to(INDE).emit('online', { antal: onlineSendt });
+    io.to(INDE).emit('online', nu);
   }, Math.max(0, onlineSidst + ONLINE_MS - Date.now()));
 }
 
@@ -178,9 +211,9 @@ const BREMSE = {
   sig: { prSek: 1, ryk: 3 },
   skriver: { prSek: 2, ryk: 3 },
   skift: { prSek: 1, ryk: 2 },
-  streng: { prSek: 1, ryk: 3 },   // ind, smid_ud og hændelser, relæet ikke kender
+  streng: { prSek: 1, ryk: 3 },   // ind, udseende, handling, smid_ud og hændelser, relæet ikke kender
 };
-const HAENDELSER = new Set(['ind', 'gaa', 'sig', 'skriver', 'skift', 'smid_ud']);
+const HAENDELSER = new Set(['ind', 'gaa', 'sig', 'skriver', 'skift', 'udseende', 'handling', 'smid_ud']);
 const BREMSE_LUK = 200;           // afviste på BREMSE_VINDUE_MS er ikke en ivrig bruger, men et script
 const BREMSE_VINDUE_MS = 10000;
 const BREMSE_GLEM_MS = 60000;     // så længe efter sidste hændelse er spandene fulde igen
@@ -228,7 +261,7 @@ io.on('connection', (socket) => {
 
   socket.on('ind', async (d) => {
     if (socket.data.person || socket.data.paaVejInd) return afvis(socket, 'ind', 'allerede_inde');
-    const k = laesToken(d && d.token);
+    const k = laesToken(d && d.token, 'ind');
     if (!k) return afvis(socket, 'ind', 'token');
     socket.data.paaVejInd = true;
     const rum = await rummene.hent(d.rum);
@@ -243,15 +276,15 @@ io.on('connection', (socket) => {
       luk(gammel.socket, 'lukket', 'ny_forbindelse');
     }
     const felt = (v) => String(v ?? '').slice(0, FELT_MAKS);
+    // Et tøj, der ikke ser rigtigt ud, koster ikke login: figuren kommer bare ind uden
     const p = {
-      id: k.id, navn: felt(k.navn), figur: felt(k.figur), gender: felt(k.gender),
+      id: k.id, navn: felt(k.navn), figur: felt(k.figur), toej: toejFra(k.toej) || {}, gender: felt(k.gender),
       hudtone: Number.isFinite(k.hudtone) ? k.hudtone : null, admin: k.admin === true || k.admin === 1,
       socket, rum, x: 0, z: 0, vej: null, t0: 0, laengde: 0, skifter: false, sigKoe: Promise.resolve(),
     };
     socket.data.person = p;
     folk.set(p.id, p);
     socket.join(INDE);
-    meldOnline();
     clearTimeout(frist);
     const oensket = punkt([d.x, d.z]);
     gaaInd(p, rum, (oensket && rum.stil(oensket)) || rum.start);
@@ -321,6 +354,25 @@ io.on('connection', (socket) => {
     const tilbage = gennemDoer && rum.kort.doere.find((doer) => doer.til === fra.navn);
     forladRum(p);
     gaaInd(p, rum, (tilbage && rum.stil(tilbage.ind)) || rum.start);
+  });
+
+  socket.on('udseende', (d) => {
+    const p = socket.data.person;
+    if (!p) return afvis(socket, 'udseende', 'ikke_inde');
+    const k = egetToken(p, d && d.token, 'udseende');
+    if (!k) return afvis(socket, 'udseende', 'token');
+    const toej = toejFra(k.toej);
+    if (typeof k.figur !== 'string' || !FIGUR.test(k.figur) || !toej) return afvis(socket, 'udseende', 'data');
+    Object.assign(p, { figur: k.figur, toej });
+    io.to(kanal(p.rum.navn)).emit('udseende', { id: p.id, figur: p.figur, toej });
+  });
+
+  socket.on('handling', (d) => {
+    const p = socket.data.person;
+    if (!p) return afvis(socket, 'handling', 'ikke_inde');
+    const navn = d && d.navn;
+    if (!HANDLINGER.has(navn)) return afvis(socket, 'handling', 'data');
+    io.to(kanal(p.rum.navn)).emit('handling', { id: p.id, navn });
   });
 
   socket.on('smid_ud', (d) => {

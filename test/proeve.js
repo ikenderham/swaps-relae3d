@@ -217,7 +217,9 @@ async function onlineForSig() {
   klienter.push(f, g);
   await f.ind(token({ id: 201, navn: 'ZZf' }), 'gade', 0.55, 0.55);
   await g.ind(token({ id: 202, navn: 'ZZg' }), 'gade', 0.65, 0.55);
-  assert.deepEqual(await g.vent('online', undefined, 7000), { antal: 2 });
+  // Lige efter rummet, og igen, når de 5 sekunder siden f's udsendelse er gået
+  assert.deepEqual(await g.vent('online'), { antal: 2, rum: { gade: 2 } });
+  assert.deepEqual(await g.vent('online', undefined, 7000), { antal: 2, rum: { gade: 2 } });
   await sov(g.sidst + 5200 - Date.now());
   // Samme konto forbinder igen: én ud og én ind i samme hændelse, så tallet ændrer sig ikke undervejs
   const f2 = new Klient(r.port);
@@ -227,12 +229,15 @@ async function onlineForSig() {
   await g.ingen('online', 1000);
   // Én går, mere end 5 sekunder efter sidste udsendelse: tallet går ud med det samme
   f2.luk();
-  assert.deepEqual(await g.vent('online', undefined, 1000), { antal: 1 });
+  assert.deepEqual(await g.vent('online', undefined, 1000), { antal: 1, rum: { gade: 1 } });
 }
 
-// A, C og E er testere, B og D admins
-const A = { id: 101, navn: 'ZZa' }, B = { id: 102, navn: 'ZZb', admin: true }, C = { id: 103, navn: 'ZZc' };
-const D = { id: 104, navn: 'ZZd', admin: true }, E = { id: 105, navn: 'ZZe' };
+// A, C og E er testere, B og D admins. B logger ind med et token som det, live-klienten får af den PHP, der
+// ligger på swaps.dk: uden typ og tøj og med 2D-figurens filnavn.
+const A = { id: 101, navn: 'ZZa' }, B = { id: 102, navn: 'ZZb', admin: true, figur: 'hvid-mand.png' };
+const C = { id: 103, navn: 'ZZc' }, D = { id: 104, navn: 'ZZd', admin: true }, E = { id: 105, navn: 'ZZe' };
+const A_TOEJ = { hair: 'kasket-skovgroen.glb' };
+const NI_DELE = Object.fromEntries(Array.from({ length: 9 }, (_, k) => [`baas${k}`, `del${k}.glb`]));
 
 const klienter = [];
 let fejlet = false;
@@ -276,6 +281,8 @@ try {
       token({ ...A, exp: Math.floor(Date.now() / 1000) - 1 }),
       `${Buffer.from(JSON.stringify(pillet)).toString('base64url')}.${sig}`,
       token({ ...A, id: 0 }),
+      token({ ...A, typ: 'udseende' }),
+      token({ ...A, typ: 'billet' }),
     ];
     // Hver på sin egen forbindelse: før ind har forbindelsen sin egen strenge spand
     for (const t of forkerte) await ny().afvist('ind', { token: t, rum: 'gade' }, 'token');
@@ -286,21 +293,25 @@ try {
     await ny().afvist('ind', { token: token(A), rum: '../gade' }, 'rum');
   });
 
-  await proeve('A går ind og står, hvor A bad om; et ind mere afvises', async () => {
-    const r = await a.ind(token(A), 'gade', 0.55, 0.55);
+  await proeve('A går ind med typen ind og sit tøj og står, hvor A bad om; online følger lige efter; et ind mere afvises', async () => {
+    const r = await a.ind(token({ ...A, typ: 'ind', toej: A_TOEJ }), 'gade', 0.55, 0.55);
     assert.equal(r.rum, 'gade');
     assert.ok(Math.abs(r.nu - Date.now()) < 1000);
     assert.equal(r.online, 1);
-    assert.deepEqual(r.folk, [{ id: 101, navn: 'ZZa', figur: 'hvid-mand', gender: 'm', hudtone: 0, admin: false, x: 0.55, z: 0.55 }]);
+    assert.deepEqual(r.folk, [{ id: 101, navn: 'ZZa', figur: 'hvid-mand', toej: A_TOEJ, gender: 'm', hudtone: 0, admin: false, x: 0.55, z: 0.55 }]);
+    assert.deepEqual(await a.vent('online'), { antal: 1, rum: { gade: 1 } });
     await a.afvist('ind', { token: token(A), rum: 'gade' }, 'allerede_inde');
   });
 
-  await proeve('B kommer ind uden for gulvet, står på nærmeste celle og ser A; A ser B komme', async () => {
+  await proeve('B kommer ind med et token som live-klientens (uden typ og tøj), står på nærmeste celle og ser A; A ser B komme', async () => {
     const r = await b.ind(token(B), 'gade', 1.03, 2.3);
     assert.equal(r.online, 2);
     const selv = r.folk.find((p) => p.id === 102);
     assert.ok(naer(selv.x, 1.05) && naer(selv.z, 1.95), JSON.stringify(selv));
+    assert.deepEqual([selv.figur, selv.toej], ['hvid-mand.png', {}]);
+    assert.deepEqual(r.folk.find((p) => p.id === 101).toej, A_TOEJ);
     assert.deepEqual(r.folk.map((p) => p.id).sort(), [101, 102]);
+    assert.deepEqual(await b.vent('online'), { antal: 2, rum: { gade: 2 } });
     const k = await a.vent('kom');
     assert.equal(k.person.id, 102);
     assert.equal(k.person.admin, true);
@@ -350,13 +361,45 @@ try {
   });
 
   await proeve('online går til dem, der er inde, når tallet ændrer sig, højst hvert 5. sekund', async () => {
-    // A kom ind først og fik 1 med det samme; B kom lige efter, og 2 går ud, når de 5 sekunder er gået
+    // Udsendelsen efter A's ind havde 1; B kom lige efter, og 2 går ud, når de 5 sekunder er gået
     const foerste = await a.vent('online'), t1 = a.sidst;
     const anden = await a.vent('online', undefined, 7000), t2 = a.sidst;
-    assert.deepEqual([foerste, anden], [{ antal: 1 }, { antal: 2 }]);
+    assert.deepEqual([foerste, anden], [{ antal: 1, rum: { gade: 1 } }, { antal: 2, rum: { gade: 2 } }]);
     assert.ok(t2 - t1 >= 4900, `${t2 - t1} ms mellem de to`);
-    assert.deepEqual(await b.vent('online', undefined, 7000), { antal: 2 });
+    assert.deepEqual(await b.vent('online', undefined, 7000), { antal: 2, rum: { gade: 2 } });
     assert.ok(!udenInd.post.some((x) => x.h === 'online'), 'en forbindelse uden ind fik online');
+  });
+
+  await proeve('udseende med et token af typen udseende til ens egen bruger går til hele rummet', async () => {
+    const ny = (krav) => token({ ...A, typ: 'udseende', figur: 'brun-mand', toej: A_TOEJ, ...krav });
+    const nyt = { figur: 'brun-mand', toej: { shirt: 'denimjakke.glb' } };
+    const [ua, ub] = await Promise.all([a.spoerg('udseende', { token: ny(nyt) }, 'udseende'), b.vent('udseende')]);
+    assert.deepEqual(ua, { id: 101, ...nyt });
+    assert.deepEqual(ub, ua);
+    await a.afvist('udseende', { token: token({ ...A, typ: 'ind' }) }, 'token');
+    await a.afvist('udseende', { token: ny({ id: 102 }) }, 'token');
+    await sov(2100);   // udseende har den strenge spand: tre i træk
+    await a.afvist('udseende', { token: ny({ exp: Math.floor(Date.now() / 1000) - 1 }) }, 'token');
+    await a.afvist('udseende', { token: ny({ toej: NI_DELE }) }, 'data');
+    await sov(2100);
+    await a.afvist('udseende', { token: ny({ toej: { shirt: '../hemmelig.glb' } }) }, 'data');
+    await a.afvist('udseende', { token: ny({ figur: 'hvid-mand.png' }) }, 'data');
+    await sov(2100);
+    // PHP skriver intet tøj som []
+    assert.deepEqual(await a.spoerg('udseende', { token: ny({ toej: [] }) }, 'udseende'), { id: 101, figur: 'brun-mand', toej: {} });
+    assert.deepEqual(await a.spoerg('udseende', { token: ny(nyt) }, 'udseende'), { id: 101, ...nyt });
+    for (let k = 0; k < 2; k++) await b.vent('udseende');
+    await sov(3100);   // fuld streng spand til handling-prøven
+  });
+
+  await proeve('handling går til hele rummet; ukendte afvises, og den strenge spand tager den fjerde i træk', async () => {
+    const [ha, hb] = await Promise.all([a.spoerg('handling', { navn: 'dans' }, 'handling'), b.vent('handling')]);
+    assert.deepEqual([ha, hb], [{ id: 101, navn: 'dans' }, { id: 101, navn: 'dans' }]);
+    await a.afvist('handling', { navn: 'flik' }, 'data');
+    assert.deepEqual(await a.spoerg('handling', { navn: 'hop' }, 'handling'), { id: 101, navn: 'hop' });
+    await a.afvist('handling', { navn: 'nik' }, 'for_hurtigt');
+    await b.vent('handling');
+    await sov(2100);
   });
 
   await proeve('skriver går til de andre i rummet, ikke til afsenderen', async () => {
@@ -431,6 +474,7 @@ try {
     const r = await a.spoerg('skift', { rum: 'cafe', via: 'cafe' }, 'rummet');
     assert.equal(r.rum, 'cafe');
     assert.deepEqual(r.folk.map((p) => [p.id, p.x, p.z]), [[101, -0.45, -0.45]]);
+    assert.deepEqual(await a.vent('online', (x) => 'cafe' in x.rum), { antal: 2, rum: { cafe: 1, gade: 1 } });
     assert.deepEqual(await b.vent('gik'), { id: 101 });
   });
 
@@ -456,6 +500,7 @@ try {
     assert.deepEqual([rb.x, rb.z], [0.05, 0.05]);
     assert.equal(rb.vej, undefined);
     assert.deepEqual([ra.vej, ra.t0], [rundtur.vej, rundtur.t0]);
+    assert.deepEqual([ra.figur, ra.toej], ['brun-mand', { shirt: 'denimjakke.glb' }]);
     const forventet = henne(rundtur.vej, (r.nu - rundtur.t0) / 1000 * FART * 2);
     assert.ok(naer(ra.x, forventet[0], 1e-6) && naer(ra.z, forventet[1], 1e-6), JSON.stringify([ra, forventet]));
     assert.equal((await a.vent('kom')).person.id, 102);
@@ -464,9 +509,10 @@ try {
 
   const c = ny(), d = ny();
   await proeve('gennem en dør til et rum uden dør tilbage lander man på start', async () => {
-    await c.ind(token(C), 'gade', 0.25, 1.75);
+    // Tøj, der ikke ser rigtigt ud, koster ikke login
+    await c.ind(token({ ...C, toej: NI_DELE }), 'gade', 0.25, 1.75);
     const r = await c.spoerg('skift', { rum: 'kaelder', via: 'kaelder' }, 'rummet');
-    assert.deepEqual(r, { rum: 'kaelder', nu: r.nu, online: 3, folk: [{ id: 103, navn: 'ZZc', figur: 'hvid-mand', gender: 'm', hudtone: 0, admin: false, x: 0.55, z: 0.55 }] });
+    assert.deepEqual(r, { rum: 'kaelder', nu: r.nu, online: 3, folk: [{ id: 103, navn: 'ZZc', figur: 'hvid-mand', toej: {}, gender: 'm', hudtone: 0, admin: false, x: 0.55, z: 0.55 }] });
   });
 
   await proeve('smid_ud: kun admins, ikke sig selv, ikke en anden admin, kun en, der er her', async () => {
@@ -532,7 +578,7 @@ try {
     b.luk();
     assert.deepEqual(await a3.vent('gik'), { id: 102 });
     assert.equal(await online(), 2);
-    assert.deepEqual(await a3.vent('online', (x) => x.antal === 2, 7000), { antal: 2 });
+    assert.deepEqual(await a3.vent('online', (x) => x.antal === 2, 7000), { antal: 2, rum: { gade: 1, kaelder: 1 } });
   });
 
   await proeve('rummene kan hentes over HTTP, og PHP nås på et *.localhost-navn', async () => {
