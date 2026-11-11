@@ -36,11 +36,18 @@ const SMID_UD_MS = 10 * 60000;
 const PHP_MS = 8000;
 const TOKEN_MAKS = 2048;
 const FELT_MAKS = 60;          // tegn i tokenets navn, figur og gender
+// Navnereglerne er de samme som i PHP
 const FIGUR = /^[a-z0-9_-]{1,40}$/;        // en figur i 3d/filer/figurer
 const TOEJ_DELE = 8;
-const BAAS = /^[a-z0-9_-]{1,20}$/;
+const BAAS = /^[a-z]{1,20}$/;
 const TOEJ_FIL = /^[a-z0-9_-]{1,60}\.glb$/; // en tøjfil i 3d/filer/toej
 const HANDLINGER = new Set(['hop', 'dans', 'nik', 'snur']);
+const UDLOEB_SLAEK_MS = 60000; // så længe efter exp kan et ind-token nå at blive fornyet
+const TIMER_MAKS_MS = 2 ** 31 - 1;
+const NR_GLEM_MS = 11 * 60000; // længere end et ind-token lever, så et gammelt nr ikke kan bruges igen
+const KOE_MAKS = 3;            // ventende beskeder pr. person
+const KOE_VENT_MS = 10000;     // en besked, der har ventet længere, afvises
+const PHP_AABNE_MAKS = 4;      // samtidige kald til besked.php
 const BESKED_MAKS = 16 * 1024; // bytes pr. hændelse; den største er en vej med 16 punkter
 const OPRYD_MS = 60000;
 const ONLINE_MS = 5000;        // højst så tit går antallet online ud til alle
@@ -48,6 +55,7 @@ const INDE = 'inde';           // socket.io-rummet med alle, der er gået ind
 
 const folk = new Map();        // id -> personen, som den står i sit rum
 const smidtUd = new Map();     // id -> ms, hvor personen må komme ind igen
+const kontoNr = new Map();     // id -> { sidst, <typ>: det seneste nr }, så et token ikke kan bruges igen
 const rummene = lavRummene(RUM_BASE);
 
 const server = http.createServer((req, res) => {
@@ -93,14 +101,85 @@ function egetToken(p, token, typ) {
   return k && k.id === p.id ? k : null;
 }
 
-/** Tøjet {bås: fil} fra et token, højst TOEJ_DELE dele, eller null, når det ikke ser sådan ud. */
+/**
+ * Tøjet {bås: fil} fra et token: de dele, der følger navnereglen, højst TOEJ_DELE. En del, der ikke gør, smides
+ * væk alene, og ældre tokens uden tøj (eller PHP's tomme []) giver intet tøj.
+ */
 function toejFra(v) {
-  // Intet tøj: ældre tokens har ikke feltet, og PHP skriver et tomt array som []
-  if (v === undefined || v === null || (Array.isArray(v) && !v.length)) return {};
-  if (typeof v !== 'object' || Array.isArray(v)) return null;
-  const dele = Object.entries(v);
+  if (!v || typeof v !== 'object' || Array.isArray(v)) return {};
   const gyldig = ([baas, fil]) => BAAS.test(baas) && typeof fil === 'string' && TOEJ_FIL.test(fil);
-  return dele.length <= TOEJ_DELE && dele.every(gyldig) ? Object.fromEntries(dele) : null;
+  return Object.fromEntries(Object.entries(v).filter(gyldig).slice(0, TOEJ_DELE));
+}
+
+const felt = (v) => String(v ?? '').slice(0, FELT_MAKS);
+const erAdmin = (k) => k.admin === true || k.admin === 1;
+
+/** Kontoens seneste nr pr. type, husket på tværs af forbindelser. */
+function nrFor(id) {
+  let d = kontoNr.get(id);
+  if (!d) kontoNr.set(id, d = {});
+  d.sidst = Date.now();
+  return d;
+}
+
+/**
+ * Typerne udseende, ting og ven bærer nr fra kontoens tæller. Giver null og husker nr, når det er nyere end
+ * kontoens seneste af typen; et token, der kommer igen eller efter et nyere, er gammelt.
+ */
+function nrGrund(id, typ, nr) {
+  if (!Number.isSafeInteger(nr)) return 'token';
+  const d = nrFor(id);
+  if (d[typ] !== undefined && nr <= d[typ]) return 'gammel';
+  d[typ] = nr;
+  return null;
+}
+
+// Et ind-token, der kan fornyes (med typ), lukkes ved exp plus slæk; de ældste uden typ kan klienten ikke forny
+function saetUdloeb(p, k) {
+  clearTimeout(p.udloeb);
+  if (k.typ === undefined) return;
+  p.udloeb = setTimeout(() => {
+    if (folk.get(p.id) !== p) return;
+    gaaUd(p);
+    luk(p.socket, 'lukket', 'udloebet');
+  }, Math.min(TIMER_MAKS_MS, Number(k.exp) * 1000 + UDLOEB_SLAEK_MS - Date.now()));
+}
+
+// Højst PHP_AABNE_MAKS kald til besked.php ad gangen; de andre venter på en plads
+let phpAabne = 0;
+const phpVenter = [];
+function phpPlads() {
+  if (phpAabne < PHP_AABNE_MAKS) {
+    phpAabne++;
+    return Promise.resolve();
+  }
+  return new Promise((ok) => phpVenter.push(ok));
+}
+function phpFri() {
+  const naeste = phpVenter.shift();
+  if (naeste) naeste();
+  else phpAabne--;
+}
+
+/**
+ * Personens beskeder går til PHP én ad gangen, i den rækkefølge de blev sagt. Står der KOE_MAKS i kø, eller har
+ * en ventet over KOE_VENT_MS, afvises den med optaget. En, der er smidt ud, får intet sendt.
+ */
+function iKoe(p, hvad, opgave) {
+  if (p.ventende >= KOE_MAKS) return afvis(p.socket, hvad, 'optaget');
+  p.ventende++;
+  const stillet = Date.now();
+  p.sigKoe = p.sigKoe.then(async () => {
+    await phpPlads();
+    try {
+      if (p.ude) return;
+      if (Date.now() - stillet > KOE_VENT_MS) return afvis(p.socket, hvad, 'optaget');
+      await opgave();
+    } finally {
+      phpFri();
+      p.ventende--;
+    }
+  }).catch((fejl) => console.error('[relae3d] beskedkøen:', fejl));
 }
 
 /** POST til 3D's PHP med HMAC over den rå krop i X-S3D-Signatur. */
@@ -162,6 +241,7 @@ function forladRum(p) {
 }
 
 function gaaUd(p) {
+  clearTimeout(p.udloeb);
   folk.delete(p.id);
   forladRum(p);
   meldOnline();
@@ -198,7 +278,7 @@ async function sig(p, rum, tekst) {
     return afvis(p.socket, 'sig', 'php');
   }
   if (svar.ok === true && typeof svar.tekst === 'string' && svar.tekst) {
-    io.to(kanal(rum)).emit('sagde', { id: p.id, tekst: svar.tekst });
+    if (!p.ude) io.to(kanal(rum)).emit('sagde', { id: p.id, tekst: svar.tekst });
   } else {
     afvis(p.socket, 'sig', svar.ok === false && typeof svar.grund === 'string' && svar.grund ? svar.grund : 'php');
   }
@@ -211,9 +291,10 @@ const BREMSE = {
   sig: { prSek: 1, ryk: 3 },
   skriver: { prSek: 2, ryk: 3 },
   skift: { prSek: 1, ryk: 2 },
-  streng: { prSek: 1, ryk: 3 },   // ind, udseende, handling, smid_ud og hændelser, relæet ikke kender
+  udseende: { prSek: 1, ryk: 5 }, // Garderoben gemmer flere skift i træk
+  streng: { prSek: 1, ryk: 3 },   // ind, forny, handling, smid_ud og hændelser, relæet ikke kender
 };
-const HAENDELSER = new Set(['ind', 'gaa', 'sig', 'skriver', 'skift', 'udseende', 'handling', 'smid_ud']);
+const HAENDELSER = new Set(['ind', 'forny', 'gaa', 'sig', 'skriver', 'skift', 'udseende', 'handling', 'smid_ud']);
 const BREMSE_LUK = 200;           // afviste på BREMSE_VINDUE_MS er ikke en ivrig bruger, men et script
 const BREMSE_VINDUE_MS = 10000;
 const BREMSE_GLEM_MS = 60000;     // så længe efter sidste hændelse er spandene fulde igen
@@ -269,21 +350,27 @@ io.on('connection', (socket) => {
     if (socket.disconnected) return;
     if ((smidtUd.get(k.id) || 0) > Date.now()) return luk(socket, 'smidt_ud', 'admin');
     if (!rum) return afvis(socket, 'ind', 'rum');
+    // ind bærer udseende-tællerens værdi: lavere end kontoens seneste udseende er et token fra før det
+    if (Number.isSafeInteger(k.nr)) {
+      const nr = nrFor(k.id);
+      if (nr.udseende !== undefined && k.nr < nr.udseende) return afvis(socket, 'ind', 'gammel');
+      nr.udseende = Math.max(nr.udseende ?? k.nr, k.nr);
+    }
     // Én forbindelse pr. konto: den gamle forlader sit rum og lukkes, før den nye kommer ind
     const gammel = folk.get(k.id);
     if (gammel) {
       gaaUd(gammel);
       luk(gammel.socket, 'lukket', 'ny_forbindelse');
     }
-    const felt = (v) => String(v ?? '').slice(0, FELT_MAKS);
-    // Et tøj, der ikke ser rigtigt ud, koster ikke login: figuren kommer bare ind uden
     const p = {
-      id: k.id, navn: felt(k.navn), figur: felt(k.figur), toej: toejFra(k.toej) || {}, gender: felt(k.gender),
-      hudtone: Number.isFinite(k.hudtone) ? k.hudtone : null, admin: k.admin === true || k.admin === 1,
-      socket, rum, x: 0, z: 0, vej: null, t0: 0, laengde: 0, skifter: false, sigKoe: Promise.resolve(),
+      id: k.id, navn: felt(k.navn), figur: felt(k.figur), toej: toejFra(k.toej), gender: felt(k.gender),
+      hudtone: Number.isFinite(k.hudtone) ? k.hudtone : null, admin: erAdmin(k),
+      socket, rum, x: 0, z: 0, vej: null, t0: 0, laengde: 0, skifter: false,
+      sigKoe: Promise.resolve(), ventende: 0, ude: false, udloeb: null,
     };
     socket.data.person = p;
     folk.set(p.id, p);
+    saetUdloeb(p, k);
     socket.join(INDE);
     clearTimeout(frist);
     const oensket = punkt([d.x, d.z]);
@@ -311,6 +398,15 @@ io.on('connection', (socket) => {
     io.to(kanal(p.rum.navn)).emit('gaar', { id: p.id, vej: tilNet(vej), t0: nu });
   });
 
+  socket.on('forny', (d) => {
+    const p = socket.data.person;
+    if (!p) return afvis(socket, 'forny', 'ikke_inde');
+    const k = egetToken(p, d && d.token, 'ind');
+    if (!k) return afvis(socket, 'forny', 'token');
+    Object.assign(p, { navn: felt(k.navn), admin: erAdmin(k) });
+    saetUdloeb(p, k);
+  });
+
   socket.on('sig', (d) => {
     const p = socket.data.person;
     if (!p) return afvis(socket, 'sig', 'ikke_inde');
@@ -318,9 +414,9 @@ io.on('connection', (socket) => {
     const tekst = d.tekst.trim();
     if (!tekst) return afvis(socket, 'sig', 'tom');
     if ([...tekst].length > TEKST_MAKS) return afvis(socket, 'sig', 'for_lang_tekst');
-    // Én besked ad gangen pr. person, så de kommer frem i den rækkefølge, de blev sagt, og i det rum
+    // Beskeden hører til det rum, den blev sagt i
     const rum = p.rum.navn;
-    p.sigKoe = p.sigKoe.then(() => sig(p, rum, tekst));
+    iKoe(p, 'sig', () => sig(p, rum, tekst));
   });
 
   socket.on('skriver', (d) => {
@@ -361,8 +457,10 @@ io.on('connection', (socket) => {
     if (!p) return afvis(socket, 'udseende', 'ikke_inde');
     const k = egetToken(p, d && d.token, 'udseende');
     if (!k) return afvis(socket, 'udseende', 'token');
+    if (typeof k.figur !== 'string' || !FIGUR.test(k.figur)) return afvis(socket, 'udseende', 'data');
+    const grund = nrGrund(p.id, 'udseende', k.nr);
+    if (grund) return afvis(socket, 'udseende', grund);
     const toej = toejFra(k.toej);
-    if (typeof k.figur !== 'string' || !FIGUR.test(k.figur) || !toej) return afvis(socket, 'udseende', 'data');
     Object.assign(p, { figur: k.figur, toej });
     io.to(kanal(p.rum.navn)).emit('udseende', { id: p.id, figur: p.figur, toej });
   });
@@ -385,16 +483,18 @@ io.on('connection', (socket) => {
     if (!q) return afvis(socket, 'smid_ud', 'ikke_online');
     if (q.admin) return afvis(socket, 'smid_ud', 'admin');
     smidtUd.set(id, Date.now() + SMID_UD_MS);
+    q.ude = true;   // beskeder i kø går hverken til PHP eller til rummet
     gaaUd(q);
     luk(q.socket, 'smidt_ud', 'admin');
   });
 });
 
-// Oprydning: spande, der er fulde igen, udløbne udsmidninger og rumnavne, der ikke fandtes
+// Oprydning: spande, der er fulde igen, udløbne udsmidninger, glemte nr og rumnavne, der ikke fandtes
 setInterval(() => {
   const nu = Date.now();
   for (const [id, d] of kontoBremse) if (nu - d.sidst > BREMSE_GLEM_MS) kontoBremse.delete(id);
   for (const [id, til] of smidtUd) if (til <= nu) smidtUd.delete(id);
+  for (const [id, d] of kontoNr) if (nu - d.sidst > NR_GLEM_MS) kontoNr.delete(id);
   rummene.ryd();
 }, OPRYD_MS).unref();
 

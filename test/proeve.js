@@ -84,7 +84,9 @@ const stub = http.createServer((req, res) => {
       const fil = path.join(RUMMAPPE, ...url.pathname.split('/').slice(2));
       return fs.existsSync(fil) ? svar(res, 200, fs.readFileSync(fil, 'utf8')) : svar(res, 404, {});
     }
-    if (req.method !== 'POST' || url.pathname !== '/3d/besked.php') return svar(res, 404, {});
+    // /3d er hovedrelæets PHP, /3d2 det relæ, der prøver køen og udløbet for sig
+    const sti = url.pathname.slice(0, url.pathname.lastIndexOf('/'));
+    if (req.method !== 'POST' || !['/3d', '/3d2'].includes(sti) || !url.pathname.endsWith('/besked.php')) return svar(res, 404, {});
     // Uden længden får PHP bag en proxy ofte en tom krop
     if (!req.headers['content-length']) return svar(res, 411, { ok: false, grund: 'laengde' });
     const rigtig = crypto.createHmac('sha256', HEMMELIGHED).update(krop).digest('base64url');
@@ -92,13 +94,20 @@ const stub = http.createServer((req, res) => {
     const b = JSON.parse(krop);
     if (Math.abs(Date.now() / 1000 - b.tid) > 30) return svar(res, 403, { ok: false, grund: 'tid' });
     beskeder.push(b);
-    const vent = /^vent(\d+)/.exec(b.tekst);
-    if (vent) await sov(Number(vent[1]));
-    if (b.tekst.includes('php_fejl')) return svar(res, 500, '<b>Fatal error</b>');
-    if (b.tekst.includes('forbudt')) return svar(res, 200, { ok: false, grund: 'ordfilter' });
-    svar(res, 200, { ok: true, tekst: b.tekst.replace(/lort/g, '****') });
+    aabne[sti] = (aabne[sti] || 0) + 1;
+    aabneMaks[sti] = Math.max(aabneMaks[sti] || 0, aabne[sti]);
+    try {
+      const vent = /^vent(\d+)/.exec(b.tekst);
+      if (vent) await sov(Number(vent[1]));
+      if (b.tekst.includes('php_fejl')) return svar(res, 500, '<b>Fatal error</b>');
+      if (b.tekst.includes('forbudt')) return svar(res, 200, { ok: false, grund: 'ordfilter' });
+      svar(res, 200, { ok: true, tekst: b.tekst.replace(/lort/g, '****') });
+    } finally {
+      aabne[sti]--;
+    }
   });
 });
+const aabne = {}, aabneMaks = {};   // kald, stubben er i gang med på én gang, pr. relæ
 await new Promise((ok) => stub.listen(0, '127.0.0.1', ok));
 const STUB = stub.address().port;
 
@@ -232,12 +241,78 @@ async function onlineForSig() {
   assert.deepEqual(await g.vent('online', undefined, 1000), { antal: 1, rum: { gade: 1 } });
 }
 
+/**
+ * Køen mod besked.php, smid_ud midt i en besked og ind-tokens, der udløber, på et relæ for sig: udløbet tager over
+ * et minut, og stubben tæller kaldene til dette relæ for sig (/3d2).
+ */
+async function koeOgUdloebForSig() {
+  const r = await startRelae({ PHP_BASE: `http://127.0.0.1:${STUB}/3d2`, RUM_BASE: RUMMAPPE });
+  const ny = () => { const x = new Klient(r.port); klienter.push(x); return x; };
+  const om = (sek) => Math.floor(Date.now() / 1000) + sek;
+
+  // h1 og h2 har ind-tokens, der udløber om 2 s; h2 fornyer, h3 har et token uden typ som live-klientens
+  const h1 = ny(), h2 = ny(), h3 = ny();
+  await h1.ind(token({ id: 301, navn: 'ZZh1', typ: 'ind', exp: om(2) }), 'kaelder', 0.55, 0.55);
+  await h2.ind(token({ id: 302, navn: 'ZZh2', typ: 'ind', exp: om(2) }), 'kaelder', 0.55, 0.55);
+  await h3.ind(token({ id: 303, navn: 'ZZh3', exp: om(2) }), 'kaelder', 0.55, 0.55);
+  h2.s.emit('forny', { token: token({ id: 302, navn: 'ZZh2 nyt navn', typ: 'ind' }) });
+  await h2.afvist('forny', { token: token({ id: 301, typ: 'ind' }) }, 'token');
+
+  // Tre ventende beskeder fra én person: den fjerde afvises straks med optaget
+  const q1 = ny();
+  await q1.ind(token({ id: 311, navn: 'ZZq1' }), 'gade', 0.55, 0.55);
+  for (const t of ['vent2500 a', 'vent2500 b', 'vent2500 c']) q1.s.emit('sig', { tekst: t });
+  await sov(1100);   // sig: tre i træk
+  await q1.afvist('sig', { tekst: 'd' }, 'optaget');
+
+  // En besked, der har ventet over 10 s, afvises med optaget, når det bliver dens tur
+  const q2 = ny();
+  await q2.ind(token({ id: 312, navn: 'ZZq2' }), 'gade', 0.65, 0.55);
+  for (const t of ['vent6000 a', 'vent6000 b', 'c']) q2.s.emit('sig', { tekst: t });
+
+  // Fem på én gang: højst fire kald er åbne mod besked.php
+  const fem = [];
+  for (let n = 0; n < 5; n++) {
+    const x = ny();
+    await x.ind(token({ id: 321 + n, navn: `ZZm${n}` }), 'cafe', 0.05 + n * 0.1, 0.05);
+    fem.push(x);
+  }
+  for (const x of fem) x.s.emit('sig', { tekst: 'vent1500 alle fem' });
+  for (let n = 0; n < 5; n++) await fem[0].vent('sagde', (y) => y.tekst === 'vent1500 alle fem', 10000);
+  for (let n = 0; n < 3; n++) await q1.vent('sagde', (y) => y.id === 311, 10000);
+  assert.deepEqual(await q2.vent('afvist', undefined, 15000), { hvad: 'sig', grund: 'optaget' });
+  assert.equal(aabneMaks['/3d2'], 4);
+
+  // smid_ud midt i en besked: den kommer ikke ud, og den næste i køen går ikke til PHP
+  const admin = ny(), offer = ny();
+  await admin.ind(token({ id: 331, navn: 'ZZadm', admin: true }), 'kaelder', 0.25, 0.25);
+  await offer.ind(token({ id: 332, navn: 'ZZoff' }), 'kaelder', 0.35, 0.25);
+  offer.s.emit('sig', { tekst: 'vent800 sidste ord' });
+  offer.s.emit('sig', { tekst: 'efter udsmidningen' });
+  await sov(200);
+  admin.s.emit('smid_ud', { id: 332 });
+  await offer.vent('smidt_ud');
+  await sov(1200);
+  assert.ok(!admin.post.some((x) => x.h === 'sagde' && x.d.id === 332), 'beskeden fra den, der blev smidt ud, kom ud');
+  assert.ok(!beskeder.some((x) => x.id === 332 && x.tekst === 'efter udsmidningen'), 'beskeden i kø gik til PHP');
+
+  // Ved exp + 60 s lukkes h1; h2 fornyede, og h3's token uden typ lukkes ikke
+  assert.deepEqual(await h1.vent('lukket', undefined, 70000), { grund: 'udloebet' });
+  await h1.vent('disconnect');
+  assert.ok(!h2.post.some((x) => x.h === 'lukket') && !h3.post.some((x) => x.h === 'lukket'));
+  const h4 = ny();
+  const rh = await h4.ind(token({ id: 304, navn: 'ZZh4' }), 'kaelder', 0.55, 0.55);
+  assert.deepEqual(rh.folk.filter((p) => p.id < 305).map((p) => [p.id, p.navn]).sort(), [[302, 'ZZh2 nyt navn'], [303, 'ZZh3'], [304, 'ZZh4']]);
+}
+
 // A, C og E er testere, B og D admins. B logger ind med et token som det, live-klienten får af den PHP, der
 // ligger på swaps.dk: uden typ og tøj og med 2D-figurens filnavn.
 const A = { id: 101, navn: 'ZZa' }, B = { id: 102, navn: 'ZZb', admin: true, figur: 'hvid-mand.png' };
 const C = { id: 103, navn: 'ZZc' }, D = { id: 104, navn: 'ZZd', admin: true }, E = { id: 105, navn: 'ZZe' };
 const A_TOEJ = { hair: 'kasket-skovgroen.glb' };
-const NI_DELE = Object.fromEntries(Array.from({ length: 9 }, (_, k) => [`baas${k}`, `del${k}.glb`]));
+const NI_DELE = Object.fromEntries(Array.from({ length: 9 }, (_, k) => [`baas${k}`, `del${k}.glb`]));   // bås med tal passer ikke
+const NI_GYLDIGE = Object.fromEntries(['hair', 'shirt', 'bukser', 'shoes', 'glasses', 'accessories', 'kappe', 'hat', 'taske']
+  .map((baas) => [baas, `${baas}-1.glb`]));
 
 const klienter = [];
 let fejlet = false;
@@ -248,6 +323,8 @@ try {
   // Kører ved siden af de andre prøver; en fejl gemmes, til den hentes nederst
   const onlineSamtidig = proeve('online: samme konto, der forbinder igen, ændrer ikke tallet, og den, der går, sendes med det samme',
     onlineForSig).catch((fejl) => fejl);
+  const koeSamtidig = proeve('køen: optaget ved tre ventende og efter 10 s, højst fire kald mod PHP, smid_ud stopper beskeder; '
+    + 'ind-tokens lukkes ved exp + 60 s uden forny, og tokens uden typ lukkes ikke', koeOgUdloebForSig).catch((fejl) => fejl);
   const ny = (port = P) => { const k = new Klient(port); klienter.push(k); return k; };
   const online = async () => (await hentJson(`http://127.0.0.1:${P}/health`)).online;
 
@@ -370,26 +447,35 @@ try {
     assert.ok(!udenInd.post.some((x) => x.h === 'online'), 'en forbindelse uden ind fik online');
   });
 
-  await proeve('udseende med et token af typen udseende til ens egen bruger går til hele rummet', async () => {
-    const ny = (krav) => token({ ...A, typ: 'udseende', figur: 'brun-mand', toej: A_TOEJ, ...krav });
+  await proeve('udseende med et nyere nr til ens egen bruger går til hele rummet; tøj, der ikke passer, smides væk del for del', async () => {
+    let nr = 0;
+    const tok = (krav) => token({ ...A, typ: 'udseende', nr: ++nr, figur: 'brun-mand', toej: A_TOEJ, ...krav });
     const nyt = { figur: 'brun-mand', toej: { shirt: 'denimjakke.glb' } };
-    const [ua, ub] = await Promise.all([a.spoerg('udseende', { token: ny(nyt) }, 'udseende'), b.vent('udseende')]);
+    const [ua, ub] = await Promise.all([a.spoerg('udseende', { token: tok(nyt) }, 'udseende'), b.vent('udseende')]);
     assert.deepEqual(ua, { id: 101, ...nyt });
     assert.deepEqual(ub, ua);
     await a.afvist('udseende', { token: token({ ...A, typ: 'ind' }) }, 'token');
-    await a.afvist('udseende', { token: ny({ id: 102 }) }, 'token');
-    await sov(2100);   // udseende har den strenge spand: tre i træk
-    await a.afvist('udseende', { token: ny({ exp: Math.floor(Date.now() / 1000) - 1 }) }, 'token');
-    await a.afvist('udseende', { token: ny({ toej: NI_DELE }) }, 'data');
-    await sov(2100);
-    await a.afvist('udseende', { token: ny({ toej: { shirt: '../hemmelig.glb' } }) }, 'data');
-    await a.afvist('udseende', { token: ny({ figur: 'hvid-mand.png' }) }, 'data');
-    await sov(2100);
+    await a.afvist('udseende', { token: tok({ id: 102 }) }, 'token');
+    await a.afvist('udseende', { token: tok({ exp: Math.floor(Date.now() / 1000) - 1 }) }, 'token');
+    await a.afvist('udseende', { token: tok({ nr: undefined }) }, 'token');
+    await sov(3100);   // udseende: fem i træk, så én i sekundet
+    await a.afvist('udseende', { token: tok({ figur: 'hvid-mand.png' }) }, 'data');
+    const blandet = { shirt: 'denimjakke.glb', hair: '../hemmelig.glb', Shoes: 'sko.glb', glasses: 7 };
+    assert.deepEqual(await a.spoerg('udseende', { token: tok({ toej: blandet }) }, 'udseende'), { id: 101, ...nyt });
     // PHP skriver intet tøj som []
-    assert.deepEqual(await a.spoerg('udseende', { token: ny({ toej: [] }) }, 'udseende'), { id: 101, figur: 'brun-mand', toej: {} });
-    assert.deepEqual(await a.spoerg('udseende', { token: ny(nyt) }, 'udseende'), { id: 101, ...nyt });
-    for (let k = 0; k < 2; k++) await b.vent('udseende');
-    await sov(3100);   // fuld streng spand til handling-prøven
+    assert.deepEqual(await a.spoerg('udseende', { token: tok({ toej: [] }) }, 'udseende'), { id: 101, figur: 'brun-mand', toej: {} });
+    await sov(3100);
+    const otte = Object.fromEntries(Object.entries(NI_GYLDIGE).slice(0, 8));
+    assert.deepEqual(await a.spoerg('udseende', { token: tok({ toej: NI_GYLDIGE }) }, 'udseende'), { id: 101, figur: 'brun-mand', toej: otte });
+    // Samme token to gange, og et ældre efter et nyere
+    const aeldre = tok(nyt), nyere = tok(nyt);
+    assert.deepEqual(await a.spoerg('udseende', { token: nyere }, 'udseende'), { id: 101, ...nyt });
+    await a.afvist('udseende', { token: nyere }, 'gammel');
+    await sov(1100);
+    await a.afvist('udseende', { token: aeldre }, 'gammel');
+    for (let k = 0; k < 4; k++) await b.vent('udseende');
+    // Et ind-token med udseende-tællerens værdi fra før det seneste udseende er gammelt
+    await ny().afvist('ind', { token: token({ ...A, typ: 'ind', nr: 3 }), rum: 'gade' }, 'gammel');
   });
 
   await proeve('handling går til hele rummet; ukendte afvises, og den strenge spand tager den fjerde i træk', async () => {
@@ -592,8 +678,10 @@ try {
     assert.deepEqual(await f.spoerg('sig', { tekst: 'hej over nettet' }, 'sagde'), { id: 106, tekst: 'hej over nettet' });
   });
 
-  const fejlSamtidig = await onlineSamtidig;
-  if (fejlSamtidig) throw fejlSamtidig;
+  for (const samtidig of [onlineSamtidig, koeSamtidig]) {
+    const fejl = await samtidig;
+    if (fejl) throw fejl;
+  }
   console.log('\nAlle prøver bestået.');
 } catch (fejl) {
   fejlet = true;
